@@ -1,243 +1,390 @@
 from datetime import datetime, timedelta
 from threading import Thread
-from unicodedata import name
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
 import time
 
+
 class Option():
-    def __init__(self, expiry, strike, right):
-        self.expiry = expiry
-        self.strike = strike
-        self.right = right
-    
+    '''
+    Represents a single options contract.
+
+    Populated in two stages:
+      1. get_options_chain()     — sets ticker, expiry, strike, right
+      2. get_prices_and_greeks() — fills in bid, ask, mid and all greeks
+    '''
+    def __init__(self, ticker, expiry, strike, right):
+        # --- identity ---
+        self.ticker = ticker
+        self.expiry = expiry    # datetime
+        self.strike = strike    # float
+        self.right  = right     # 'P' or 'C'
+
+        # --- populated by get_prices_and_greeks() ---
+        self.bid   = None
+        self.ask   = None
+        self.mid   = None
+        self.iv    = None
+        self.delta = None
+        self.gamma = None
+        self.vega  = None
+        self.theta = None
+
+    def is_priced(self):
+        ''' Returns True if price data has been populated '''
+        return self.mid is not None
+
     def __str__(self):
-        return f"Expiry: {self.expiry} , Strike: {self.strike} , Right: {self.right}"
+        return (
+            f"{self.ticker} {self.right} "
+            f"exp={self.expiry.strftime('%Y%m%d')} "
+            f"strike={self.strike} "
+            f"mid={self.mid} delta={self.delta}"
+        )
+
+    def __repr__(self):
+        return self.__str__()
+
 
 class OptionsChainPrices(EWrapper, EClient):
-    ''' Serves as the client and the wrapper '''
+    '''
+    IBKR API client for fetching options chains, prices, and greeks.
+
+    Designed for sequential multi-security use — call get_options_chain()
+    then get_prices_and_greeks() for each ticker in turn. State is reset
+    between tickers automatically.
+
+    req_id allocation:
+      - _req_id_counter is a global monotonically increasing counter that
+        is NEVER reset for the lifetime of the connection.
+      - Every request (underlying price, chain details, option prices, IV)
+        gets its own unique ID from next_req_id().
+      - Callbacks identify which request they belong to by looking up the
+        req_id in registry dicts that map req_id -> Option object directly.
+      - All lookups in callbacks are O(1) dict gets — no linear search.
+    '''
+
     def __init__(self, addr, port, client_id):
         EWrapper.__init__(self)
-        EClient. __init__(self, self)
-        # Connect to TWS
+        EClient.__init__(self, self)
+
         self.connect(addr, port, client_id)
 
-        self.ticker = None
-        self.exchange = None
-        self.expirations = None
-        self.strikes = None
+        # Global req_id counter — never reset between tickers
+        self._req_id_counter = 0
 
-        self.underlying_price = None
-        self.options_chain_returned = None
+        # Only bid (1) and ask (2) — last price is stale for options
+        self.TRACKED_PRICE_FIELDS = {1, 2}
 
-        self.chain = set()
+        self._reset_per_ticker_state()
 
-        self.req_id = 2
-
-        self.options_price_chain = {}
-        self.option_request_track = {}
-
-        self.target_expiry = None
-        self.target_delta = None
-
-        self.num_options_contracts_remaining = None
-
-        self.closest_low_date = datetime.today() - timedelta(days=365)
-        self.closest_high_date = datetime.today() + timedelta(days=365)
-
-        # Launch the client thread
         thread = Thread(target=self.run)
         thread.start()
-        time.sleep(0.5)#give this thread some time to start
+        time.sleep(0.5)
 
+    # ------------------------------------------------------------------
+    # req_id allocation
+    # ------------------------------------------------------------------
 
-    def get_options_chain(self, ticker : str, target_expiry_date : datetime ):
+    def next_req_id(self):
         '''
-        External entry function to get the options chain:
-        Fetches the prices for options, with the input delta, and inputed expiry date
+        Allocate and return the next unique request ID.
+        The only place req_ids are ever created — never hardcode one.
         '''
-        self.ticker = ticker
+        self._req_id_counter += 1
+        return self._req_id_counter
+
+    # ------------------------------------------------------------------
+    # Per-ticker state
+    # ------------------------------------------------------------------
+
+    def _reset_per_ticker_state(self):
+        '''
+        Clear all state that belongs to a single ticker.
+        Called at the start of get_options_chain() for each new security.
+        _req_id_counter is intentionally excluded — it never resets.
+        '''
+        self.ticker        = None
+        self.target_expiry = None
+
+        # Underlying price for the current ticker
+        self.underlying_price = None
+
+        # Set to True when contractDetailsEnd fires
+        self._chain_complete = None
+
+        # The options chain as a flat list of Option objects
+        self.chain: list[Option] = []
+
+        # Closest expiry dates bracketing target_expiry
+        self.closest_low_date  = datetime.today() - timedelta(days=365)
+        self.closest_high_date = datetime.today() + timedelta(days=365)
+
+        # req_id for the underlying mkt data request
+        self._underlying_req_id = None
+
+        # req_id for the contract details request
+        self._chain_req_id = None
+
+        # Maps price req_id -> Option object
+        # This is the core of the callback routing — when IBKR sends back
+        # a tick for req_id 42, we look up which Option object that belongs
+        # to in O(1) and write directly onto it. No hashes, no parsing.
+        self._req_id_to_option: dict[int, Option] = {}
+
+        # Maps IV req_id -> Option object (separate namespace from price req_ids)
+        self._iv_req_id_to_option: dict[int, Option] = {}
+
+        # Tracks how many price fields are still expected per req_id.
+        # Initialised to 2 (bid + ask) per option, deleted when it hits 0
+        # so stale/duplicate ticks can't re-decrement the counter.
+        self._price_track: dict[int, int] = {}
+
+        # Shared countdown polled by the while loops in public methods
+        self._remaining = None
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _build_contract(self, option: Option) -> Contract:
+        ''' Build an IBKR Contract object from an Option '''
+        contract = Contract()
+        contract.symbol     = option.ticker
+        contract.secType    = 'OPT'
+        contract.exchange   = 'CBOE'
+        contract.currency   = 'USD'
+        contract.lastTradeDateOrContractMonth = option.expiry.strftime('%Y%m%d')
+        contract.strike     = option.strike
+        contract.right      = option.right
+        contract.multiplier = '100'
+        return contract
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def get_options_chain(self, ticker: str, target_expiry_date: datetime):
+        '''
+        Fetch the full options chain for a single ticker.
+        Safe to call multiple times sequentially for different tickers.
+
+        Returns:
+            chain            : List[Option]  — all contracts, unpriced
+            closest_high_date: datetime      — nearest expiry >= target
+            closest_low_date : datetime      — nearest expiry <  target
+        '''
+        self._reset_per_ticker_state()
+
+        self.ticker        = ticker
         self.target_expiry = target_expiry_date
+        print(f"[{ticker}] requesting chain, target expiry: {target_expiry_date.date()}")
 
-        print("target expiry:" , self.target_expiry)
+        # --- Underlying price ---
+        self._underlying_req_id = self.next_req_id()
+        underlying          = Contract()
+        underlying.symbol   = ticker
+        underlying.secType  = 'STK'
+        underlying.exchange = 'SMART'
+        underlying.currency = 'USD'
+        self.reqMktData(self._underlying_req_id, underlying, '', True, False, [])
 
-        #Request the last price of the underlying
-        underlying_contract = Contract()
-        underlying_contract.symbol = ticker
-        underlying_contract.secType = 'STK'
-        underlying_contract.exchange = 'SMART'
-        underlying_contract.currency = 'USD'
-        self.reqMktData(0, underlying_contract, '', True, False, [])
+        # --- Full options chain ---
+        self._chain_req_id = self.next_req_id()
+        opt_contract          = Contract()
+        opt_contract.symbol   = ticker
+        opt_contract.secType  = 'OPT'
+        opt_contract.currency = 'USD'
+        opt_contract.exchange = 'CBOE'
+        self.reqContractDetails(self._chain_req_id, opt_contract)
 
-
-        #Request the options chain: will request all possible strikes and expiries
-        options_contract = Contract()
-        options_contract.symbol = ticker
-        options_contract.secType = 'OPT'
-        options_contract.currency = 'USD'
-        options_contract.exchange = 'CBOE'
-
-        self.reqContractDetails(1 , options_contract)
-
-        #Everything after this point requres underlying price
         while self.underlying_price is None:
             time.sleep(1)
-        print("underlying_price received")
+        print(f"[{ticker}] underlying price: {self.underlying_price}")
 
-        while self.options_chain_returned is None:
+        while self._chain_complete is None:
             time.sleep(1)
-        print("Options Chain returned")
+        print(f"[{ticker}] chain complete — {len(self.chain)} contracts")
 
-        ### Format Options Chain Nicer ###
-        return_chain = []
-        for option_hash in self.chain:
-            data = option_hash.split("/")
-            expiry, right, strike = data[0], data[1] , data[3]
-            return_chain.append(Option(datetime.strptime(expiry, '%Y%m%d'), strike, right))
+        return self.chain, self.closest_high_date, self.closest_low_date
+
+    def get_prices_and_greeks(self, options: list[Option]):
         
-        return return_chain, self.closest_high_date, self.closest_low_date
+        # TODO FIX BUGS LEFT IN BY AI
 
-    def request_option_prices_greeks(self, options_chain , ticker ):
-        '''
-        Provides options prices and greeks for specifiedf options chain. 
-        options_chain: collection of hashes representing expiry date + right + strike
-                expiry date: str '%Y%m%d'
-                right: "P" or "C"
-                strike: int
-        
-        ticker: str
-        '''
-        request_index_to_option_map = {} 
+        if self.underlying_price is None:
+            raise RuntimeError(
+                "underlying_price is not set. Call get_options_chain() first "
+                "or set app.underlying_price manually before calling this."
+            )
 
-        self.num_options_contracts_remaining = len(options_chain)
+        self._remaining = len(options)
 
-        for option_hash in options_chain:
-            data = option_hash.split("/")
-            expiry, right, strike = data[0], data[1] , data[3]
+        # --- First pass: request bid/ask for each option ---
+        for option in options:
+            rid = self.next_req_id()
+            self._req_id_to_option[rid] = option   # map req_id -> Option object
+            self._price_track[rid]      = 2         # expecting bid + ask
+            self.reqMktData(rid, self._build_contract(option), '', True, False, [])
 
-            option = Contract()
-            option.symbol = ticker
-            option.secType = 'OPT'
-            option.currency = 'USD'
-            option.exchange = 'CBOE'
-            option.lastTradeDateOrContractMonth = expiry
-            option.strike = strike
-            option.right = right
-            
-            self.reqMktData(self.req_id, option , '', True, False, [])
-            self.option_request_track[self.req_id] = 3
-            self.options_price_chain[self.req_id] = {} #init the price chain
-            request_index_to_option_map[option_hash] = self.req_id
-            self.req_id += 1
-        
-        while self.num_options_contracts_remaining > 0:
-            print("contracts remaining", self.num_options_contracts_remaining)
+        while self._remaining > 0:
+            print(f"[{self.ticker}] price requests remaining: {self._remaining}")
             time.sleep(1)
-        print("Done processing option greeks")
-        
+        print(f"[{self.ticker}] all prices received — requesting greeks")
 
-        ### Once the prices are retrieved, we can get the greeks and IV
-        ### Map the hash back to the price chain
-        self.num_options_contracts_remaining = len(self.options_price_chain)
-        for id in self.options_price_chain:
-            data = option_hash.split("/")
-            expiry, right, strike = data[0], data[1] , data[3]
-            last_price = self.options_price_chain[id]["last_price"]
+        # --- Second pass: IV / greeks for options with a valid mid ---
+        priced  = [o for o in options if o.mid is not None and o.mid > 0]
+        skipped = len(options) - len(priced)
+        if skipped:
+            print(f"[{self.ticker}] skipping greeks for {skipped} options with no valid mid")
 
-            print("expiry : " + expiry + " right : " + str(right) + " stirke : " + str(strike) + " last_price : " + str(last_price))
+        self._remaining = len(priced)
 
-            contract = Contract()
-            contract.symbol = ticker
-            contract.secType = "OPT"
-            contract.exchange = "SMART"
-            contract.currency = "USD"
-            contract.lastTradeDateOrContractMonth = expiry
-            contract.strike = strike
-            contract.right = right
-            contract.multiplier = "100"
+        for option in priced:
+            iv_rid = self.next_req_id()
+            self._iv_req_id_to_option[iv_rid] = option  # map IV req_id -> Option object
+            self.calculateImpliedVolatility(
+                iv_rid,
+                self._build_contract(option),
+                option.mid,
+                self.underlying_price,
+                []
+            )
 
-            #im not sure if i can reuse id's but hopefully
-            self.calculateImpliedVolatility(id, contract, last_price, self.underlying_price, [])
-        
-        while self.num_options_contracts_remaining > 0:
+        while self._remaining > 0:
+            print(f"[{self.ticker}] greek requests remaining: {self._remaining}")
             time.sleep(1)
-        
-        return self.options_price_chain
+        print(f"[{self.ticker}] done — all greeks received")
 
-    #CALLBACK - reqContractDetails
+        return options
+
+    # ------------------------------------------------------------------
+    # IBKR Callbacks
+    # ------------------------------------------------------------------
+
     def contractDetails(self, reqId, desc):
         '''
-        when requesting options, every possible strike price is returned, this function gets returned to multiple times, which each possible value in the chain
-        we can do some data processing here to try to get the expiry which is closest to our desired time, and load all the strikes for that
+        Called once per contract when reqContractDetails returns.
+        Creates an Option object for each contract and appends to self.chain.
         '''
+        if reqId != self._chain_req_id:
+            print("Request doesnt line up with stored variable")
+            return
 
-        if reqId == 1:
-            strike = desc.contract.strike
-            #print(desc.contract.exchange)
-            #print(desc.contract.multiplier)
-            right = desc.contract.right
-            expiry_date =  datetime.strptime(desc.contract.lastTradeDateOrContractMonth, '%Y%m%d')
-            expiry_hash = desc.contract.lastTradeDateOrContractMonth + "/" + right + "/" + str(strike)
-            
-            if expiry_hash not in self.chain:
-                self.chain.add(expiry_hash)
+        expiry_date = datetime.strptime(
+            desc.contract.lastTradeDateOrContractMonth, '%Y%m%d'
+        )
 
-            ### We can to find the dates that are closest to the target time ###
-            if expiry_date >= self.target_expiry: 
-                if expiry_date < self.closest_high_date:
-                    self.closest_high_date = expiry_date
-            else:
-                if expiry_date > self.closest_low_date:
-                    self.closest_low_date = expiry_date
-            
-            print("received", strike, right, expiry_date, expiry_hash)
+        self.chain.append(Option(
+            ticker = self.ticker,
+            expiry = expiry_date,
+            strike = desc.contract.strike,
+            right  = desc.contract.right
+        ))
 
-    #CALLBACK
+        # Track the two expiry dates bracketing the target
+        if expiry_date >= self.target_expiry:
+            if expiry_date < self.closest_high_date:
+                self.closest_high_date = expiry_date
+        else:
+            if expiry_date > self.closest_low_date:
+                self.closest_low_date = expiry_date
+
     def contractDetailsEnd(self, reqId):
-        '''
-        gets triggered when all the options contracts are done returning
-        '''
-        if reqId == 1:
-            self.options_chain_returned = True
-        
-
-    #CALLBACK for 
-    def tickOptionComputation(self, reqId, tickType, tickAttrib, impliedVol, delta, optPrice, pvDividend, gamma, vega, theta, undPrice):
-        self.options_price_chain[reqId]["implied vol"] = impliedVol
-        self.options_price_chain[reqId]["delta"] = delta
-        self.options_price_chain[reqId]["options price"] = optPrice
-        self.options_price_chain[reqId]["Dividends"] = pvDividend
-        self.options_price_chain[reqId]["gamma"] = gamma
-        self.options_price_chain[reqId]["vega"] = vega
-        self.options_price_chain[reqId]["theta"] = theta
-
-        self.num_options_contracts_remaining -= 1
-
+        if reqId == self._chain_req_id:
+            self._chain_complete = True
 
     def tickPrice(self, req_id, field, price, attribs):
-        ''' Provide option's ask price/bid price '''
+        '''
+        Receives price ticks for the underlying and options.
 
-        if req_id == 0: #we know its the underlying request
-            if field == 4:
+        For options: looks up the Option object directly from _req_id_to_option
+        in O(1), writes bid/ask onto it, and calculates mid once both arrive.
+        '''
+        # Underlying tick
+        if req_id == self._underlying_req_id:
+            if field == 4:  # LAST
                 self.underlying_price = price
+            return
+
+        if field not in self.TRACKED_PRICE_FIELDS:
+            return
+
+        # Guard against stale/duplicate ticks after we've finished processing
+        # this req_id (it gets deleted from _price_track when count hits 0)
+        if req_id not in self._price_track:
+            return
+
+        # O(1) lookup — this is why we map req_id -> Option directly
+        option = self._req_id_to_option.get(req_id)
+        if option is None:
+            return
+
+        if field == 1:
+            option.bid = price
+        elif field == 2:
+            option.ask = price
+
+        self._price_track[req_id] -= 1
+
+        if self._price_track[req_id] == 0:
+            del self._price_track[req_id]
+
+            # IBKR sends -1 to mean "no market" — treat as invalid
+            if option.bid is not None and option.ask is not None \
+                    and option.bid >= 0 and option.ask >= 0:
+                option.mid = round((option.bid + option.ask) / 2, 4)
             else:
-                print('tickPrice - field: {}, price: {}'.format(field,price))
-        else: 
-            if field == 4: #LAST PRICE
-                self.options_price_chain[req_id]['last_price'] = price
-                self.option_request_track[req_id] -= 1
-                if self.option_request_track[req_id] == 0:
-                    self.num_options_contracts_remaining -= 1
+                option.mid = None
+                print(f"no valid market for {option} — mid set to None")
 
-            if field == 1: #BID PRICE
-                self.options_price_chain[req_id]['bid_price'] = price
-                self.option_request_track[req_id] -= 1
-                if self.option_request_track[req_id] == 0:
-                    self.num_options_contracts_remaining -= 1
+            self._remaining -= 1
 
-            if field == 2: #ASK PRICE
-                self.options_price_chain[req_id]['ask_price'] = price
-                self.option_request_track[req_id] -= 1
-                if self.option_request_track[req_id] == 0:
-                    self.num_options_contracts_remaining -= 1
+    def tickGeneric(self, reqId: TickerId, tickType: TickType, value: float):
+        print(tickType)
+        print(value)
+
+        if tickType == 24: 
+            self.return_vol[reqId]["implied_vol"] = value
+        
+        if tickType == 23:
+            self.return_vol[reqId]["30_day_historical_vol"] = value
+        
+        if self.volatility_req_tracker[reqId] == 0:
+            self.cancelMktData(reqId)
+            self.remaining_requests -= 1
+
+    # def tickOptionComputation(self, reqId, tickType, tickAttrib,
+    #                           impliedVol, delta, optPrice, pvDividend,
+    #                           gamma, vega, theta, undPrice):
+    #     '''
+
+    #     '''
+    #     if tickType != 13:
+    #         return
+
+    #     # Check price req_id first, then IV req_id — both are O(1)
+    #     option = self._req_id_to_option.get(reqId) \
+    #           or self._iv_req_id_to_option.get(reqId)
+
+    #     if option is None:
+    #         return
+
+    #     option.iv    = impliedVol
+    #     option.delta = delta
+    #     option.gamma = gamma
+    #     option.vega  = vega
+    #     option.theta = theta
+
+    #     self._remaining -= 1
+
+    def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=None):
+        '''
+        Codes below 2000 are real errors.
+        2000+ are informational (market data farm connections etc.)
+        '''
+        if errorCode < 2000:
+            print(f"ERROR — reqId: {reqId}, code: {errorCode}, msg: {errorString}")
+        else:
+            print(f"INFO  — reqId: {reqId}, code: {errorCode}, msg: {errorString}")
