@@ -1,0 +1,9 @@
+services:
+  bottom_flip:
+    container_name: service_name
+    build:
+        context:  .
+        dockerfile: Dockerfile
+    network_mode: host
+    environment:
+        TZ : America/New_York  # Set the timezone
