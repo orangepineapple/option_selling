@@ -1,5 +1,6 @@
 /venv
 ./venv
+.env
 
 # Python
 __pycache__/
@@ -22,3 +23,5 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+
+/gh_token.txt
