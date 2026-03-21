@@ -1,8 +1,10 @@
 from datetime import datetime, timedelta
 from threading import Thread
 from ibapi.client import EClient
+from ibapi.common import TickAttrib, TickerId
+from ibapi.ticktype import TickType
 from ibapi.wrapper import EWrapper
-from ibapi.contract import Contract
+from ibapi.contract import Contract, ContractDetails
 import time
 
 
@@ -106,7 +108,7 @@ class OptionsChainPrices(EWrapper, EClient):
         _req_id_counter is intentionally excluded — it never resets.
         '''
         self.ticker        = None
-        self.target_expiry = None
+        self.target_expiry = datetime.today() + timedelta(days=45) #Default
 
         # Underlying price for the current ticker
         self.underlying_price = None
@@ -143,6 +145,9 @@ class OptionsChainPrices(EWrapper, EClient):
 
         # Shared countdown polled by the while loops in public methods
         self._remaining = None
+
+        self.high_date_option = None
+        self.low_date_option = None
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -188,7 +193,9 @@ class OptionsChainPrices(EWrapper, EClient):
         underlying.secType  = 'STK'
         underlying.exchange = 'SMART'
         underlying.currency = 'USD'
-        self.reqMktData(self._underlying_req_id, underlying, '', True, False, [])
+        
+        # Get the price, average IV , and 30-day Historical IV
+        self.reqMktData(self._underlying_req_id, underlying, '106,104', True, False, [])
 
         # --- Full options chain ---
         self._chain_req_id = self.next_req_id()
@@ -207,63 +214,63 @@ class OptionsChainPrices(EWrapper, EClient):
             time.sleep(1)
         print(f"[{ticker}] chain complete — {len(self.chain)} contracts")
 
-        return self.chain, self.closest_high_date, self.closest_low_date
+        return self.chain, self.high_date_option, self.low_date_option
 
-    def get_prices_and_greeks(self, options: list[Option]):
+    # def get_prices_and_greeks(self, options: list[Option]):
         
-        # TODO FIX BUGS LEFT IN BY AI
+    #     # TODO FIX BUGS LEFT IN BY AI
 
-        if self.underlying_price is None:
-            raise RuntimeError(
-                "underlying_price is not set. Call get_options_chain() first "
-                "or set app.underlying_price manually before calling this."
-            )
+    #     if self.underlying_price is None:
+    #         raise RuntimeError(
+    #             "underlying_price is not set. Call get_options_chain() first "
+    #             "or set app.underlying_price manually before calling this."
+    #         )
 
-        self._remaining = len(options)
+    #     self._remaining = len(options)
 
-        # --- First pass: request bid/ask for each option ---
-        for option in options:
-            rid = self.next_req_id()
-            self._req_id_to_option[rid] = option   # map req_id -> Option object
-            self._price_track[rid]      = 2         # expecting bid + ask
-            self.reqMktData(rid, self._build_contract(option), '', True, False, [])
+    #     # --- First pass: request bid/ask for each option ---
+    #     for option in options:
+    #         rid = self.next_req_id()
+    #         self._req_id_to_option[rid] = option   # map req_id -> Option object
+    #         self._price_track[rid]      = 2         # expecting bid + ask
+    #         self.reqMktData(rid, self._build_contract(option), '', True, False, [])
 
-        while self._remaining > 0:
-            print(f"[{self.ticker}] price requests remaining: {self._remaining}")
-            time.sleep(1)
-        print(f"[{self.ticker}] all prices received — requesting greeks")
+    #     while self._remaining > 0:
+    #         print(f"[{self.ticker}] price requests remaining: {self._remaining}")
+    #         time.sleep(1)
+    #     print(f"[{self.ticker}] all prices received — requesting greeks")
 
-        # --- Second pass: IV / greeks for options with a valid mid ---
-        priced  = [o for o in options if o.mid is not None and o.mid > 0]
-        skipped = len(options) - len(priced)
-        if skipped:
-            print(f"[{self.ticker}] skipping greeks for {skipped} options with no valid mid")
+    #     # --- Second pass: IV / greeks for options with a valid mid ---
+    #     priced  = [o for o in options if o.mid is not None and o.mid > 0]
+    #     skipped = len(options) - len(priced)
+    #     if skipped:
+    #         print(f"[{self.ticker}] skipping greeks for {skipped} options with no valid mid")
 
-        self._remaining = len(priced)
+    #     self._remaining = len(priced)
 
-        for option in priced:
-            iv_rid = self.next_req_id()
-            self._iv_req_id_to_option[iv_rid] = option  # map IV req_id -> Option object
-            self.calculateImpliedVolatility(
-                iv_rid,
-                self._build_contract(option),
-                option.mid,
-                self.underlying_price,
-                []
-            )
+    #     for option in priced:
+    #         iv_rid = self.next_req_id()
+    #         self._iv_req_id_to_option[iv_rid] = option  # map IV req_id -> Option object
+    #         self.calculateImpliedVolatility(
+    #             iv_rid,
+    #             self._build_contract(option),
+    #             option.mid,
+    #             self.underlying_price,
+    #             []
+    #         )
 
-        while self._remaining > 0:
-            print(f"[{self.ticker}] greek requests remaining: {self._remaining}")
-            time.sleep(1)
-        print(f"[{self.ticker}] done — all greeks received")
+    #     while self._remaining > 0:
+    #         print(f"[{self.ticker}] greek requests remaining: {self._remaining}")
+    #         time.sleep(1)
+    #     print(f"[{self.ticker}] done — all greeks received")
 
-        return options
+    #     return options
 
     # ------------------------------------------------------------------
     # IBKR Callbacks
     # ------------------------------------------------------------------
 
-    def contractDetails(self, reqId, desc):
+    def contractDetails(self, reqId: TickerId, contractDetails: ContractDetails):
         '''
         Called once per contract when reqContractDetails returns.
         Creates an Option object for each contract and appends to self.chain.
@@ -273,29 +280,32 @@ class OptionsChainPrices(EWrapper, EClient):
             return
 
         expiry_date = datetime.strptime(
-            desc.contract.lastTradeDateOrContractMonth, '%Y%m%d'
+            contractDetails.contract.lastTradeDateOrContractMonth, '%Y%m%d'
         )
-
-        self.chain.append(Option(
+        curr_opt = Option(
             ticker = self.ticker,
             expiry = expiry_date,
-            strike = desc.contract.strike,
-            right  = desc.contract.right
-        ))
+            strike = contractDetails.contract.strike,
+            right  = contractDetails.contract.right
+        )
+        self.chain.append(curr_opt)
 
         # Track the two expiry dates bracketing the target
         if expiry_date >= self.target_expiry:
             if expiry_date < self.closest_high_date:
                 self.closest_high_date = expiry_date
+                self.high_date_option = curr_opt
         else:
             if expiry_date > self.closest_low_date:
                 self.closest_low_date = expiry_date
+                self.low_date_option = curr_opt
 
     def contractDetailsEnd(self, reqId):
         if reqId == self._chain_req_id:
             self._chain_complete = True
 
-    def tickPrice(self, req_id, field, price, attribs):
+    def tickPrice(self, reqId: int, tickType: int, price: float, attrib: TickAttrib):
+    
         '''
         Receives price ticks for the underlying and options.
 
@@ -303,33 +313,33 @@ class OptionsChainPrices(EWrapper, EClient):
         in O(1), writes bid/ask onto it, and calculates mid once both arrive.
         '''
         # Underlying tick
-        if req_id == self._underlying_req_id:
-            if field == 4:  # LAST
+        if reqId == self._underlying_req_id:
+            if tickType == 4:  # LAST
                 self.underlying_price = price
             return
 
-        if field not in self.TRACKED_PRICE_FIELDS:
+        if tickType not in self.TRACKED_PRICE_FIELDS:
             return
 
         # Guard against stale/duplicate ticks after we've finished processing
         # this req_id (it gets deleted from _price_track when count hits 0)
-        if req_id not in self._price_track:
+        if reqId not in self._price_track:
             return
 
         # O(1) lookup — this is why we map req_id -> Option directly
-        option = self._req_id_to_option.get(req_id)
+        option = self._req_id_to_option.get(reqId)
         if option is None:
             return
 
-        if field == 1:
+        if tickType == 1:
             option.bid = price
-        elif field == 2:
+        elif tickType == 2:
             option.ask = price
 
-        self._price_track[req_id] -= 1
+        self._price_track[reqId] -= 1
 
-        if self._price_track[req_id] == 0:
-            del self._price_track[req_id]
+        if self._price_track[reqId] == 0:
+            del self._price_track[reqId]
 
             # IBKR sends -1 to mean "no market" — treat as invalid
             if option.bid is not None and option.ask is not None \
@@ -355,36 +365,26 @@ class OptionsChainPrices(EWrapper, EClient):
             self.cancelMktData(reqId)
             self.remaining_requests -= 1
 
-    # def tickOptionComputation(self, reqId, tickType, tickAttrib,
-    #                           impliedVol, delta, optPrice, pvDividend,
-    #                           gamma, vega, theta, undPrice):
-    #     '''
-
-    #     '''
-    #     if tickType != 13:
-    #         return
-
-    #     # Check price req_id first, then IV req_id — both are O(1)
-    #     option = self._req_id_to_option.get(reqId) \
-    #           or self._iv_req_id_to_option.get(reqId)
-
-    #     if option is None:
-    #         return
-
-    #     option.iv    = impliedVol
-    #     option.delta = delta
-    #     option.gamma = gamma
-    #     option.vega  = vega
-    #     option.theta = theta
-
-    #     self._remaining -= 1
-
-    def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=None):
+    def tickOptionComputation(self, reqId, tickType, tickAttrib,
+                              impliedVol, delta, optPrice, pvDividend,
+                              gamma, vega, theta, undPrice):
         '''
-        Codes below 2000 are real errors.
-        2000+ are informational (market data farm connections etc.)
+
         '''
-        if errorCode < 2000:
-            print(f"ERROR — reqId: {reqId}, code: {errorCode}, msg: {errorString}")
-        else:
-            print(f"INFO  — reqId: {reqId}, code: {errorCode}, msg: {errorString}")
+        if tickType != 13:
+            return
+
+        # Check price req_id first, then IV req_id — both are O(1)
+        option = self._req_id_to_option.get(reqId) \
+              or self._iv_req_id_to_option.get(reqId)
+
+        if option is None:
+            return
+
+
+        self._remaining -= 1
+
+
+    def error(self, reqId: TickerId, errorTime: TickerId, errorCode: TickerId, errorString: str, advancedOrderRejectJson=""):
+
+        print(errorCode, errorString)
