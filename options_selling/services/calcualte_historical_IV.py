@@ -1,20 +1,21 @@
 from data.IB_historical import HistoricalData
 from config.constants import HOST, CLIENT_NUM
-from data.db_operations import upsert_price_bars, upsert_iv_bars, fetch_price_bars, get_universe , upsert_hv_values
+from data.db_operations import upsert_price_bars, upsert_iv_bars, fetch_price_bars, get_universe , upsert_hv_values, fetch_iv_bars
 from data.db_connect import connect, close_connection
-from trading_util.data_util import Bar, Backfill, HistoricalVolatility
-
+from trading_util.data_util import Bar, Backfill, HVValues
+from trading_util.date_util import isTradingDay
 import math
-
-from datetime import  datetime
+from typing import Optional
+from datetime import timedelta , date
 
 
 def caluclate_historical_IV():
-    # if not isTradingDay(): return
+    if not isTradingDay(): return
     conn = connect()
+    universe = get_universe(conn)
 
     ## UPDATE THE DATA ##
-    price_backfills, iv_backfills = get_backfill_status(conn)
+    price_backfills, iv_backfills = get_backfill_plans(conn, universe)
     client = HistoricalData(HOST, 4002, CLIENT_NUM)
     price_data = client.get_historical_data(price_backfills, "1 day", "stock")
     iv_data = client.get_historical_data(iv_backfills, "1 day", "options")
@@ -28,7 +29,7 @@ def caluclate_historical_IV():
     
 
     ## PULL DATA AND DO CALCULATIONS
-    universe = get_universe(conn)
+
     for ticker in universe:    
         one_year_historical = fetch_price_bars(conn, ticker)
 
@@ -46,94 +47,67 @@ def caluclate_historical_IV():
         else:
             print(f"[{ticker}] insufficient bars for hv_252: {len(one_year_historical)} < 252")
 
-        hv = HistoricalVolatility(
+        historical_iv_bars = fetch_iv_bars(conn, ticker)
+        iv_values = [b.close_iv for b in historical_iv_bars]
+        
+        iv_52w_high = max(iv_values)
+        iv_52w_low = min(iv_values)
+
+        hv = HVValues(
             ticker     = ticker,
             hv_60      = hv_60,
             hv_252     = hv_252,
-            calculated = datetime.now()
+            iv_52w_high= iv_52w_high,
+            iv_52w_low = iv_52w_low,
         )
 
         upsert_hv_values(conn, ticker, hv)
 
     close_connection(conn)
 
+caluclate_historical_IV()
 
-def get_backfill_status(conn) -> tuple[list[Backfill], list[Backfill]]:
-    '''
-    Returns one BackfillStatus per ticker in the tickers table.
-    Checks price_bars and iv_bars independently so each table
-    can be backfilled separately if needed.
-    '''
-    sql = '''
-        SELECT
-            t.symbol,
-            MAX(pb.date)                                AS last_price_bar,
-            MAX(ib.date)                                AS last_iv_bar,
-            CASE
-                WHEN MAX(pb.date) IS NULL THEN -1
-                ELSE (CURRENT_DATE - MAX(pb.date))::INT
-            END                                         AS price_days_missing,
-            CASE
-                WHEN MAX(ib.date) IS NULL THEN -1
-                ELSE (CURRENT_DATE - MAX(ib.date))::INT
-            END                                         AS iv_days_missing,
-            MAX(pb.date) IS NULL                        AS needs_price_backfill,
-            MAX(ib.date) IS NULL                        AS needs_iv_backfill
-
-        FROM tickers t
-        LEFT JOIN price_bars pb ON pb.ticker_id = t.id
-        LEFT JOIN iv_bars    ib ON ib.ticker_id = t.id
-
-        GROUP BY t.id, t.symbol
-        ORDER BY t.symbol;
-    '''
-
-    with conn.cursor() as cur:
-        cur.execute(sql)
-        rows = cur.fetchall()
+def get_backfill_plans(conn, tickers):
+    # The query template for both tables
+    # We use %s::varchar[] to tell Postgres this is an array of strings
+    query = """
+        SELECT t.ticker_col, (CURRENT_DATE - MAX(table_alias.date)) + 1 as gap
+        FROM (SELECT UNNEST(%s::varchar[]) as ticker_col) t
+        LEFT JOIN {table} table_alias ON table_alias.{col} = t.ticker_col
+        GROUP BY t.ticker_col
+    """
 
     iv_backfills = []
     price_backfills = []
 
-    # BackfillStatus(
-    #         symbol               = row[0],
-    #         last_price_bar       = row[1],
-    #         last_iv_bar          = row[2],
-    #         price_days_missing   = row[3],
-    #         iv_days_missing      = row[4],
-    #         needs_price_backfill = row[5],
-    #         needs_iv_backfill    = row[6]
-    #     )
+    with conn.cursor() as cur:
+        # 1. Fetch all IV gaps in one trip
+        cur.execute(query.format(table="iv_bars", col="symbol"), (tickers,))
+        for ticker, gap in cur.fetchall():
+            # If gap is 0 or less, they are up to date, so we skip
+            if gap is None or gap > 0:
+                iv_backfills.append(Backfill(ticker=ticker, delta=ibkr_duration_string(gap)))
 
-    for row in rows:
-        if row[5]:
-            price_backfills.append(Backfill(
-                ticker=row[0], 
-                delta=ibkr_duration_string(row[3])
-            ))
-        if row[6]:
-            iv_backfills.append(
-                Backfill(
-                    ticker=row[0],
-                    delta=ibkr_duration_string(row[4])
-                )
-            )
+        # 2. Fetch all Price gaps in one trip
+        cur.execute(query.format(table="daily_historical", col="stock"), (tickers,))
+        for ticker, gap in cur.fetchall():
+            if gap is None or gap > 0:
+                price_backfills.append(Backfill(ticker=ticker, delta=ibkr_duration_string(gap)))
 
-    return price_backfills, iv_backfills
+    return iv_backfills, price_backfills
 
-
-def ibkr_duration_string(days_missing: int, full_backfill_duration: str = "1 Y") -> str:
-
-    if days_missing == -1:
-        return full_backfill_duration
+def ibkr_duration_string(days_missing: int) -> str:
+    # None means the LEFT JOIN found no data for this ticker
+    if days_missing is None:
+        return "1 Y"
 
     if days_missing > 364:
         return "3 Y"
-    else:
-        return str(days_missing) + " D"
+    
+    return f"{days_missing} D"
 
 
-def _yang_zhang(bars: list[Bar]) -> float:
+def _yang_zhang(bars: list[Bar]) -> Optional[float]:
     '''
     Yang-Zhang volatility estimator.
 

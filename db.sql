@@ -3,37 +3,12 @@
 -- =============================================================
 
 -- -------------------------------------------------------------
--- tickers
+-- Universe for options
 -- -------------------------------------------------------------
-CREATE TABLE tickers (
-    id          SERIAL      PRIMARY KEY,
-    symbol      VARCHAR(10) NOT NULL UNIQUE,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+CREATE TABLE options_universe (
+    symbol     VARCHAR(10)  PRIMARY KEY,
+    created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
-
-
--- -------------------------------------------------------------
--- price_bars
--- Daily OHLCV bars used for Yang-Zhang HV calculation.
--- Keep the last 252 rows per ticker.
--- -------------------------------------------------------------
-CREATE TABLE price_bars (
-    id          SERIAL          PRIMARY KEY,
-    ticker_id   INT             NOT NULL REFERENCES tickers(id) ON DELETE CASCADE,
-    date        DATE            NOT NULL,
-    open        NUMERIC(12, 4)  NOT NULL,
-    high        NUMERIC(12, 4)  NOT NULL,
-    low         NUMERIC(12, 4)  NOT NULL,
-    close       NUMERIC(12, 4)  NOT NULL,
-    volume      BIGINT,
-    num_trades  INT,
-    created_at  TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-
-    CONSTRAINT uq_price_bars_ticker_date UNIQUE (ticker_id, date)
-);
-
-CREATE INDEX idx_price_bars_ticker_date ON price_bars (ticker_id, date DESC);
-
 
 -- -------------------------------------------------------------
 -- iv_bars
@@ -42,17 +17,11 @@ CREATE INDEX idx_price_bars_ticker_date ON price_bars (ticker_id, date DESC);
 -- Keep the last 252 rows per ticker.
 -- -------------------------------------------------------------
 CREATE TABLE iv_bars (
-    id          SERIAL         PRIMARY KEY,
-    ticker_id   INT            NOT NULL REFERENCES tickers(id) ON DELETE CASCADE,
-    date        DATE           NOT NULL,
-    close_iv    NUMERIC(8, 6)  NOT NULL,
-    created_at  TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
-
-    CONSTRAINT uq_iv_bars_ticker_date UNIQUE (ticker_id, date)
+    date     DATE          NOT NULL,
+    symbol   VARCHAR(10)   NOT NULL,
+    close_iv NUMERIC(8, 6) NOT NULL,
+    PRIMARY KEY (date, symbol)
 );
-
-CREATE INDEX idx_iv_bars_ticker_date ON iv_bars (ticker_id, date DESC);
-
 
 -- -------------------------------------------------------------
 -- hv_values
@@ -67,11 +36,10 @@ CREATE INDEX idx_iv_bars_ticker_date ON iv_bars (ticker_id, date DESC);
 --   iv_rank = (live_iv - iv_52w_low) / (iv_52w_high - iv_52w_low) * 100
 -- -------------------------------------------------------------
 CREATE TABLE hv_values (
-    id            SERIAL         PRIMARY KEY,
-    ticker_id     INT            NOT NULL REFERENCES tickers(id) ON DELETE CASCADE UNIQUE,
-    hv_60         NUMERIC(8, 6),  -- 60-day  Yang-Zhang HV, annualized
-    hv_252        NUMERIC(8, 6),  -- 252-day Yang-Zhang HV, annualized
-    iv_52w_high   NUMERIC(8, 6),  -- 52-week high close IV (from iv_bars)
-    iv_52w_low    NUMERIC(8, 6),  -- 52-week low  close IV (from iv_bars)
-    calculated_at TIMESTAMPTZ    NOT NULL DEFAULT NOW()
+    symbol        VARCHAR(10)   NOT NULL PRIMARY KEY,
+    hv_60         NUMERIC(8, 6),
+    hv_252        NUMERIC(8, 6),
+    iv_52w_high   NUMERIC(8, 6),
+    iv_52w_low    NUMERIC(8, 6),
+    calculated_at TIMESTAMPTZ   NOT NULL DEFAULT NOW()
 );
