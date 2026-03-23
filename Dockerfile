@@ -27,4 +27,4 @@ COPY . .
 RUN pip3 install .
 
 # CMD ["tail", "-f", "/dev/null"] Left in for testing
-CMD ["python", "bottom_flip/schedual.py"]
+CMD ["python", "options_selling/schedual.py"]

@@ -145,6 +145,8 @@ class IronCondor(EWrapper, EClient):
         contract.right = "C"
         contract.multiplier = "100"
 
+        self.reqContractDetails()
+
         # Long PUT  - Outter 2
         contract = Contract()
         contract.symbol = self.ticker

@@ -7,7 +7,6 @@ from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract, ContractDetails
 import time
 
-
 class Option():
     '''
     Represents a single options contract.
@@ -24,10 +23,10 @@ class Option():
         self.right  = right     # 'P' or 'C'
 
         # --- populated by get_prices_and_greeks() ---
-        self.bid   = None
-        self.ask   = None
-        self.mid   = None
-        self.iv    = None
+        self.bid = None
+        self.ask = None
+        self.mid = None
+        self.iv  = None
         self.delta = None
         self.gamma = None
         self.vega  = None
@@ -112,6 +111,8 @@ class OptionsChainPrices(EWrapper, EClient):
 
         # Underlying price for the current ticker
         self.underlying_price = None
+        self.underlying_IV = None
+        self.underyling_Historical_IV = None
 
         # Set to True when contractDetailsEnd fires
         self._chain_complete = None
@@ -195,7 +196,7 @@ class OptionsChainPrices(EWrapper, EClient):
         underlying.currency = 'USD'
         
         # Get the price, average IV , and 30-day Historical IV
-        self.reqMktData(self._underlying_req_id, underlying, '106,104', True, False, [])
+        self.reqMktData(self._underlying_req_id, underlying, '106,104', False, False, [])
 
         # --- Full options chain ---
         self._chain_req_id = self.next_req_id()
@@ -206,9 +207,12 @@ class OptionsChainPrices(EWrapper, EClient):
         opt_contract.exchange = 'CBOE'
         self.reqContractDetails(self._chain_req_id, opt_contract)
 
-        while self.underlying_price is None:
+        while self.underlying_IV is None or self.underyling_Historical_IV is None: #TODO add back self.underlying_price is None or
             time.sleep(1)
-        print(f"[{ticker}] underlying price: {self.underlying_price}")
+        
+        # We have recevied the data, we can cancel the live stream
+        self.cancelMktData(self._underlying_req_id)
+        print(f"[{ticker}] underlying price: {self.underlying_price} IV: {self.underlying_IV}, Historical VOL: {self.underyling_Historical_IV}")
 
         while self._chain_complete is None:
             time.sleep(1)
@@ -216,55 +220,55 @@ class OptionsChainPrices(EWrapper, EClient):
 
         return self.chain, self.high_date_option, self.low_date_option
 
-    # def get_prices_and_greeks(self, options: list[Option]):
+    def get_prices_and_greeks(self, options: list[Option]):
         
-    #     # TODO FIX BUGS LEFT IN BY AI
+        # TODO FIX BUGS LEFT IN BY AI
 
-    #     if self.underlying_price is None:
-    #         raise RuntimeError(
-    #             "underlying_price is not set. Call get_options_chain() first "
-    #             "or set app.underlying_price manually before calling this."
-    #         )
+        if self.underlying_price is None:
+            raise RuntimeError(
+                "underlying_price is not set. Call get_options_chain() first "
+                "or set app.underlying_price manually before calling this."
+            )
 
-    #     self._remaining = len(options)
+        self._remaining = len(options)
 
-    #     # --- First pass: request bid/ask for each option ---
-    #     for option in options:
-    #         rid = self.next_req_id()
-    #         self._req_id_to_option[rid] = option   # map req_id -> Option object
-    #         self._price_track[rid]      = 2         # expecting bid + ask
-    #         self.reqMktData(rid, self._build_contract(option), '', True, False, [])
+        # --- First pass: request bid/ask for each option ---
+        for option in options:
+            rid = self.next_req_id()
+            self._req_id_to_option[rid] = option   # map req_id -> Option object
+            self._price_track[rid]      = 2         # expecting bid + ask
+            self.reqMktData(rid, self._build_contract(option), '', True, False, [])
 
-    #     while self._remaining > 0:
-    #         print(f"[{self.ticker}] price requests remaining: {self._remaining}")
-    #         time.sleep(1)
-    #     print(f"[{self.ticker}] all prices received — requesting greeks")
+        while self._remaining > 0:
+            print(f"[{self.ticker}] price requests remaining: {self._remaining}")
+            time.sleep(1)
+        print(f"[{self.ticker}] all prices received — requesting greeks")
 
-    #     # --- Second pass: IV / greeks for options with a valid mid ---
-    #     priced  = [o for o in options if o.mid is not None and o.mid > 0]
-    #     skipped = len(options) - len(priced)
-    #     if skipped:
-    #         print(f"[{self.ticker}] skipping greeks for {skipped} options with no valid mid")
+        # --- Second pass: IV / greeks for options with a valid mid ---
+        priced  = [o for o in options if o.mid is not None and o.mid > 0]
+        skipped = len(options) - len(priced)
+        if skipped:
+            print(f"[{self.ticker}] skipping greeks for {skipped} options with no valid mid")
 
-    #     self._remaining = len(priced)
+        self._remaining = len(priced)
 
-    #     for option in priced:
-    #         iv_rid = self.next_req_id()
-    #         self._iv_req_id_to_option[iv_rid] = option  # map IV req_id -> Option object
-    #         self.calculateImpliedVolatility(
-    #             iv_rid,
-    #             self._build_contract(option),
-    #             option.mid,
-    #             self.underlying_price,
-    #             []
-    #         )
+        for option in priced:
+            iv_rid = self.next_req_id()
+            self._iv_req_id_to_option[iv_rid] = option  # map IV req_id -> Option object
+            self.calculateImpliedVolatility(
+                iv_rid,
+                self._build_contract(option),
+                option.mid,
+                self.underlying_price,
+                []
+            )
 
-    #     while self._remaining > 0:
-    #         print(f"[{self.ticker}] greek requests remaining: {self._remaining}")
-    #         time.sleep(1)
-    #     print(f"[{self.ticker}] done — all greeks received")
+        while self._remaining > 0:
+            print(f"[{self.ticker}] greek requests remaining: {self._remaining}")
+            time.sleep(1)
+        print(f"[{self.ticker}] done — all greeks received")
 
-    #     return options
+        return options
 
     # ------------------------------------------------------------------
     # IBKR Callbacks
@@ -356,14 +360,10 @@ class OptionsChainPrices(EWrapper, EClient):
         print(value)
 
         if tickType == 24: 
-            self.return_vol[reqId]["implied_vol"] = value
+            self.underlying_IV = value
         
         if tickType == 23:
-            self.return_vol[reqId]["30_day_historical_vol"] = value
-        
-        if self.volatility_req_tracker[reqId] == 0:
-            self.cancelMktData(reqId)
-            self.remaining_requests -= 1
+            self.underyling_Historical_IV = value
 
     def tickOptionComputation(self, reqId, tickType, tickAttrib,
                               impliedVol, delta, optPrice, pvDividend,
