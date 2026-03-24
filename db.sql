@@ -39,7 +39,6 @@ CREATE TABLE hv_values (
     symbol        VARCHAR(10)   NOT NULL PRIMARY KEY,
     hv_60         NUMERIC(8, 6),
     hv_252        NUMERIC(8, 6),
-    iv_52w_high   NUMERIC(8, 6),
-    iv_52w_low    NUMERIC(8, 6),
+    iv_percentile NUMERIC(6, 2),
     calculated_at TIMESTAMPTZ   NOT NULL DEFAULT NOW()
 );

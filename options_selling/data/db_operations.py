@@ -152,57 +152,45 @@ def fetch_iv_bars(conn, symbol: str, limit: int = 252) -> list[IVBar]:
 # =============================================================
 
 def upsert_hv_values(conn, symbol: str, hv: HVValues) -> None:
-    '''
-    Upsert the nightly HV and 52-week IV bounds for a ticker.
-    One row per ticker — fully replaced on each batch run.
-    '''
     sql = '''
         INSERT INTO hv_values
-            (symbol, hv_60, hv_252, iv_52w_high, iv_52w_low, calculated_at)
-        VALUES (%s, %s, %s, %s, %s, NOW())
+            (symbol, hv_60, hv_252, iv_percentile, calculated_at)
+        VALUES (%s, %s, %s, %s, NOW())
         ON CONFLICT (symbol) DO UPDATE SET
             hv_60         = EXCLUDED.hv_60,
             hv_252        = EXCLUDED.hv_252,
-            iv_52w_high   = EXCLUDED.iv_52w_high,
-            iv_52w_low    = EXCLUDED.iv_52w_low,
+            iv_percentile = EXCLUDED.iv_percentile,
             calculated_at = NOW();
     '''
- 
+
     with conn.cursor() as cur:
         cur.execute(sql, (
             symbol.upper(),
             hv.hv_60,
             hv.hv_252,
-            hv.iv_52w_high,
-            hv.iv_52w_low
+            hv.iv_percent,
         ))
     conn.commit()
 
 def fetch_hv_values(conn, symbol: str) -> Optional[HVValues]:
-    '''
-    Fetch the stored HV and 52-week IV bounds for a ticker.
-    Called during the trading day scan for real-time IV rank calculation.
-    Returns None if no values have been calculated yet.
-    '''
     sql = '''
-        SELECT hv_60, hv_252, iv_52w_high, iv_52w_low
+        SELECT hv_60, hv_252, iv_percentile
         FROM hv_values
         WHERE symbol = %s;
     '''
- 
+
     with conn.cursor() as cur:
         cur.execute(sql, (symbol.upper(),))
         row = cur.fetchone()
- 
+
     if row is None:
         return None
- 
+
     return HVValues(
-        ticker      = symbol,
-        hv_60       = float(row[0]) if row[0] else None,
-        hv_252      = float(row[1]) if row[1] else None,
-        iv_52w_high = float(row[2]) if row[2] else None,
-        iv_52w_low  = float(row[3]) if row[3] else None
+        ticker        = symbol.upper(),
+        hv_60         = float(row[0]) if row[0] else None,
+        hv_252        = float(row[1]) if row[1] else None,
+        iv_percent = float(row[2]) if row[2] else None,
     )
 
 
@@ -235,29 +223,3 @@ def fetch_price_bars(conn, symbol: str, limit: int = 252) -> list[Bar]:
         )
         for row in reversed(rows)
     ]
-
-
-# =============================================================
-# Real-time IV rank calculation (called during trading hours)
-# =============================================================
-
-def calculate_iv_rank(live_iv: float, hv: HVValues) -> Optional[float]:
-    '''
-    Calculate IV rank in real time using live IV and stored 52-week bounds.
-    Call this during the trading day scan after fetching live IV from IBKR.
-
-    Args:
-        live_iv: current IV of the underlying from tickGeneric tickType 24
-        hv     : HVValues fetched from DB (contains iv_52w_high, iv_52w_low)
-
-    Returns:
-        IV rank as 0-100 float, or None if bounds are missing or equal
-    '''
-    if hv.iv_52w_high is None or hv.iv_52w_low is None:
-        return None
-
-    iv_range = hv.iv_52w_high - hv.iv_52w_low
-    if iv_range == 0:
-        return 0.0
-
-    return round((live_iv - hv.iv_52w_low) / iv_range * 100, 2)

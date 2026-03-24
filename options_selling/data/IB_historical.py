@@ -44,9 +44,8 @@ class HistoricalData(EWrapper, EClient):
         time.sleep(0.5) # give this thread some time to start
 
     def _reset_counters(self):
-        self.data_arrived = []
         self.return_data = {}
-        self.backfills = []
+
     
     def get_historical_data(self, backfills : list[Backfill], bar_duration : str , type : str) -> dict[str, list[Bar]]:
         if len(backfills) == 0:
@@ -81,11 +80,14 @@ class HistoricalData(EWrapper, EClient):
             self.reqHistoricalData(index , stock, '', backfill.delta, bar_duration , DATA_TYPE , 1, 1 , False, [])
 
         while self.check_all_data_arrived() == False:
+            print("WAITING")
             time.sleep(1)
         
         # Remove Tickers that were not found
         for ticker in self.invalid_tickers:
             self.return_data.pop(ticker)
+        
+        print("HISTORICAL FINISHED", DATA_TYPE)
 
         return self.return_data
        
